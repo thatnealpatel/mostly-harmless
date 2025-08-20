@@ -9,6 +9,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -133,7 +134,7 @@ func fetchMod(ctx context.Context, path, version string) ([]byte, error) {
 		return nil, err
 	}
 	defer res.Body.Close()
-	if res.StatusCode == http.StatusGone {
+	if res.StatusCode == http.StatusGone || res.StatusCode == http.StatusNotFound {
 		return nil, errorGone
 	}
 	if res.StatusCode != http.StatusOK {
@@ -152,7 +153,7 @@ func fetchZipHead(ctx context.Context, path, version string) (string, int64, err
 		return "", 0, err
 	}
 	defer res.Body.Close()
-	if res.StatusCode == http.StatusGone {
+	if res.StatusCode == http.StatusGone || res.StatusCode == http.StatusNotFound {
 		return "", 0, errorGone
 	}
 	if res.StatusCode != http.StatusOK {
@@ -171,7 +172,7 @@ func fetchZip(ctx context.Context, path, version string) ([]byte, error) {
 		return nil, err
 	}
 	defer res.Body.Close()
-	if res.StatusCode == http.StatusGone {
+	if res.StatusCode == http.StatusGone || res.StatusCode == http.StatusNotFound {
 		return nil, errorGone
 	}
 	if res.StatusCode != http.StatusOK {
@@ -216,9 +217,11 @@ func ignoreFile(name string) bool {
 var pbTemplate pb.ProgressBarTemplate = `{{string . "prefix"}} {{counters . }} {{bar . }} {{percent . }} {{etime . }}`
 
 func main() {
+	gob.Register(map[string]string{})
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to `FILE`")
 	memprofile := flag.String("memprofile", "", "write memory profile to `FILE`")
 	compress := flag.Bool("z", false, "compress the output tar archive with gzip")
+	indexBinFile := flag.String("file", "", "binary file containing index to use")
 	all := flag.Bool("all", false, "include potential forks (mismatching and missing go.mod)")
 	flag.Parse()
 
@@ -238,40 +241,19 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	latest, err := fetchLatest(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-	tree, err := tlog.ParseTree(latest)
-	if err != nil {
-		log.Fatal(err)
-	}
+	var latestVersions map[string]string
+	var bar *pb.ProgressBar
 
-	bar := pbTemplate.Start64(tree.N).Set("prefix", "Fetching index...")
-	latestVersions := make(map[string]string)
-
-	i, err := NewIndex(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	var linesSeen uint64
-	for {
-		v, err := i.next(ctx)
-		if err == io.EOF {
-			break
-		}
+	if *indexBinFile == "" {
+		latestVersions = fetchIndex(ctx, bar)
+	} else {
+		file, err := os.ReadFile(*indexBinFile)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalf("cannot read %q: %v", *indexBinFile, err)
 		}
-		linesSeen++
-		bar.Increment()
-
-		if semver.Compare(v.Version, latestVersions[v.Path]) >= 0 {
-			latestVersions[v.Path] = v.Version
-		}
+		buf := bytes.NewBuffer(file)
+		gob.NewDecoder(buf).Decode(&latestVersions)
 	}
-	bar.Finish()
 
 	outMu := &sync.Mutex{}
 	var out io.WriteCloser = os.Stdout
@@ -285,7 +267,7 @@ func main() {
 	gcp := semaphore.NewWeighted(500) // GCS can take it, and it's way way slower
 	g, ctx := errgroup.WithContext(ctx)
 
-	var gone, invalidName, vendor, spam, mismatchedGoMod, invalidGoMod int64
+	var gone, unknown, nilModOrModule, invalidName, vendor, spam, mismatchedGoMod, invalidGoMod int64
 	var noGoCode, noGoMod, gcsBytes, good, goBytes, allBytes, goFiles int64
 	for path, version := range latestVersions {
 		if err := ctx.Err(); err != nil {
@@ -301,6 +283,8 @@ func main() {
 		}
 
 		path, version := path, version
+		// prefer to record non-material errors and return
+		// nil to prevent failing fast on allcode download.
 		g.Go(func() error {
 			releaseOnce := &sync.Once{}
 			defer releaseOnce.Do(func() { sem.Release(1) })
@@ -325,11 +309,18 @@ func main() {
 				return nil
 			}
 			if err != nil {
-				return err
+				atomic.AddInt64(&unknown, 1)
+				return nil
+				// return err
 			}
 			mod, err := modfile.ParseLax(path+"@"+version, modBytes, nil)
 			if err != nil {
 				atomic.AddInt64(&invalidGoMod, 1)
+				return nil
+			}
+			if mod == nil || mod.Module == nil {
+				log.Printf("unexpected nil for %q: %v", path+"@"+version, mod)
+				atomic.AddInt64(&nilModOrModule, 1)
 				return nil
 			}
 			if mod.Module.Mod.Path != path && !*all {
@@ -343,7 +334,9 @@ func main() {
 				return nil
 			}
 			if err != nil {
-				return err
+				atomic.AddInt64(&unknown, 1)
+				return nil
+				// return err
 			}
 			if strings.HasPrefix(url, "https://storage.googleapis.com/") {
 				atomic.AddInt64(&gcsBytes, size)
@@ -358,7 +351,9 @@ func main() {
 				return nil
 			}
 			if err != nil {
-				return err
+				atomic.AddInt64(&unknown, 1)
+				return nil
+				//return err
 			}
 			atomic.AddInt64(&allBytes, size)
 
@@ -449,6 +444,8 @@ func main() {
 	fmt.Fprintf(os.Stderr, "Spam:                 % 7d -\n", spam)
 	fmt.Fprintf(os.Stderr, "Invalid names:        % 7d -\n", invalidName)
 	fmt.Fprintf(os.Stderr, "Gone:                 % 7d -\n", gone)
+	fmt.Fprintf(os.Stderr, "Nil:                  % 7d -\n", nilModOrModule)
+	fmt.Fprintf(os.Stderr, "Unknown:              % 7d -\n", unknown)
 	fmt.Fprintf(os.Stderr, "Invalid go.mod files: % 7d -\n", invalidGoMod)
 	if !*all {
 		fmt.Fprintf(os.Stderr, "Mismatching go.mod:   % 7d -\n", mismatchedGoMod)
@@ -472,4 +469,54 @@ func main() {
 			log.Fatal("could not write memory profile: ", err)
 		}
 	}
+}
+
+// fetchIndex gets the current module index
+// from sum.golang.org that is required to
+// walk and download Go modules.
+func fetchIndex(ctx context.Context, bar *pb.ProgressBar) map[string]string {
+	latest, err := fetchLatest(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tree, err := tlog.ParseTree(latest)
+	if err != nil {
+		log.Fatal(err)
+	}
+	bar = pbTemplate.Start64(tree.N).Set("prefix", "Fetching index...")
+	latestVersions := make(map[string]string)
+	i, err := NewIndex(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var linesSeen uint64
+	for {
+		v, err := i.next(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		linesSeen++
+		bar.Increment()
+
+		if semver.Compare(v.Version, latestVersions[v.Path]) >= 0 {
+			latestVersions[v.Path] = v.Version
+		}
+	}
+	bar.Finish()
+
+	const defaultFilePath = "latest_versions.gob"
+	file, err := os.Create(defaultFilePath)
+	if err != nil {
+		log.Printf("failed to create file: %v", err)
+	}
+	defer file.Close()
+	if err := gob.NewEncoder(file).Encode(&latestVersions); err != nil {
+		log.Printf("failed to encode %s: %v", defaultFilePath, err)
+	}
+
+	return latestVersions
 }
